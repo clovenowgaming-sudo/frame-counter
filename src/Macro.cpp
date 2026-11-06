@@ -52,105 +52,156 @@ struct Reader {
     }
 };
 
-bool readInputs(Reader r, uint64_t total, uint64_t p1, bool extPerInput,
-                std::vector<MacroInput>& out, size_t& endPos) {
-    out.clear();
-    if (total > r.n || p1 > total) return false;
-    int64_t prev = 0;
-    for (uint64_t i = 0; i < total; ++i) {
-        bool p2 = i >= p1;
-        if (i == p1) prev = 0;
-        uint8_t b0 = r.u8();
-        bool cont = (b0 & 1) != 0;
-        bool down = ((b0 >> 1) & 1) != 0;
-        uint64_t delta = (b0 >> 2) & 0x3F;
-        if (cont) delta |= r.varint() << 6;
-        if (extPerInput) {
-            uint64_t sz = r.varint();
-            r.skip(sz);
-        }
-        if (r.fail) return false;
-        prev += static_cast<int64_t>(delta);
-        MacroInput in;
-        in.tick = prev;
-        in.down = down;
-        in.p2 = p2;
-        in.button = 1;
-        out.push_back(in);
-    }
-    endPos = r.p;
+enum class NumMode { BigEndian, LittleEndian, Varint };
+
+struct Gdr2Try {
+    bool ok = false;
+    bool full = false;  // every byte of the file was used
+    bool platformer = false;
+    std::string err;
+    Macro m;
+};
+
+bool rawNum(Reader& r, int bytes, bool big, uint64_t& out) {
+    if (static_cast<size_t>(bytes) > r.n - r.p) { r.fail = true; return false; }
+    out = 0;
+    for (int i = 0; i < bytes; ++i) out = (out << 8) | r.d[r.p + (big ? i : bytes - 1 - i)];
+    r.p += bytes;
     return true;
 }
 
-bool parseGdr2(std::vector<uint8_t> const& data, Macro& m, std::string& err) {
+// Strings are a varint length + bytes in the files bots write today.
+std::string lstr(Reader& r) {
+    uint64_t len = r.varint();
+    std::string s;
+    if (r.fail || len > r.n - r.p) { r.fail = true; return s; }
+    s.assign(reinterpret_cast<char const*>(r.d + r.p), static_cast<size_t>(len));
+    r.p += static_cast<size_t>(len);
+    return s;
+}
+
+// packing 0: one varint, (frameDelta << 1) | down   (what Eclipse/xdBot files use)
+// packing 1: README table, byte0 = cont | down<<1 | delta<<2, rest is a varint
+// strMode 0: length-prefixed strings, 1: null-terminated strings (README)
+Gdr2Try tryGdr2(std::vector<uint8_t> const& data, NumMode mode, bool ext, int packing, int strMode) {
+    Gdr2Try t;
     Reader r(data.data(), data.size());
+    auto str = [&]() { return strMode == 0 ? lstr(r) : r.cstr(); };
     r.skip(3);  // "GDR"
     uint64_t version = r.varint();
-    (void)version;
-    std::string inputTag = r.cstr();
-    std::string author = r.cstr();
-    std::string desc = r.cstr();
-    uint64_t duration = r.varint();
-    uint64_t gameVersion = r.varint();
-    uint64_t framerate = r.varint();
-    uint64_t seed = r.varint();
-    uint64_t coins = r.varint();
-    (void)duration; (void)gameVersion; (void)seed; (void)coins; (void)author; (void)desc;
-    r.u8();  // ldm
-    bool platformer = r.u8() != 0;
-    std::string botName = r.cstr();
+    std::string tag = str();
+    str();  // author
+    str();  // description
+    if (r.fail || version < 1 || version > 255) { t.err = "not a GDR2 header"; return t; }
+    if (ext && tag.empty()) return t;  // nothing to test without a custom input tag
+
+    bool big = mode != NumMode::LittleEndian;
+    uint64_t u = 0;
+    double fps = 0;
+    if (mode == NumMode::Varint) r.varint();
+    else if (!rawNum(r, 4, big, u)) { t.err = "cut short"; return t; }
+    r.varint();  // game version
+    if (mode == NumMode::Varint) fps = static_cast<double>(r.varint());
+    else {
+        if (!rawNum(r, 8, big, u)) { t.err = "cut short"; return t; }
+        std::memcpy(&fps, &u, 8);
+    }
+    if (r.fail || !(fps >= 1 && fps <= 100000)) { t.err = "bad TPS"; return t; }
+
+    r.varint();  // seed
+    r.varint();  // coins
+    r.u8();      // ldm
+    bool plat = r.u8() != 0;
+    std::string botName = str();
     r.varint();  // bot version
     r.varint();  // level id
-    std::string levelName = r.cstr();
+    std::string levelName = str();
     uint64_t extSize = r.varint();
     r.skip(extSize);
-    uint64_t deathCount = r.varint();
-    if (r.fail || deathCount > data.size()) {
-        err = "GDR2 header is broken (cut short or not a GDR2 file).";
-        return false;
-    }
-    for (uint64_t i = 0; i < deathCount; ++i) r.varint();
+    uint64_t deaths = r.varint();
+    if (r.fail || deaths > r.n - r.p) { t.err = "broken death list"; return t; }
+    for (uint64_t i = 0; i < deaths; ++i) r.varint();
     uint64_t total = r.varint();
     uint64_t p1 = r.varint();
-    if (r.fail) {
-        err = "GDR2 data is cut short before the inputs.";
-        return false;
-    }
+    if (r.fail || total > r.n - r.p || p1 > total) { t.err = "broken input count"; return t; }
+    if (plat) { t.platformer = true; t.err = "Platformer macros are not supported."; return t; }
 
-    m.format = "GDR2";
-    m.bot = botName;
-    m.level = levelName;
-    m.tps = framerate > 0 ? static_cast<double>(framerate) : 240.0;
-    m.platformer = platformer;
-    if (platformer) {
-        err = "Platformer macros are not supported.";
-        return false;
+    int64_t frame = 0;
+    size_t presses = 0;
+    for (uint64_t i = 0; i < total; ++i) {
+        if (i == p1) frame = 0;  // P2 deltas start over
+        bool down = false;
+        uint64_t delta = 0;
+        if (packing == 0) {
+            uint64_t packed = r.varint();
+            delta = packed >> 1;
+            down = (packed & 1) != 0;
+        } else {
+            uint8_t b0 = r.u8();
+            down = ((b0 >> 1) & 1) != 0;
+            delta = (b0 >> 2) & 0x3F;
+            if (b0 & 1) delta |= r.varint() << 6;
+        }
+        if (ext) r.skip(r.varint());
+        if (r.fail) { t.err = "inputs cut short"; return t; }
+        frame += static_cast<int64_t>(delta);
+        if (frame > 0x7fffffffLL) { t.err = "bad frame"; return t; }
+        MacroInput in;
+        in.tick = frame;
+        in.down = down;
+        in.p2 = i >= p1;
+        in.button = 1;
+        if (down) ++presses;
+        t.m.inputs.push_back(in);
     }
+    if (presses == 0) { t.err = "no presses (wrong layout?)"; return t; }
 
-    // The per-input extension block is only present for bots that use a custom
-    // input tag, so try the most likely layout first and fall back to the other.
-    bool order[2] = {!inputTag.empty(), inputTag.empty()};
-    std::vector<MacroInput> inputs;
-    size_t endPos = 0;
-    bool ok = false;
-    for (bool ext : order) {
-        if (readInputs(r, total, p1, ext, inputs, endPos) && endPos == data.size()) {
-            ok = true;
-            break;
+    t.m.format = "GDR2";
+    t.m.bot = botName;
+    t.m.level = levelName;
+    t.m.tps = fps;
+    t.ok = true;
+    t.full = r.p == r.n;
+    return t;
+}
+
+bool parseGdr2(std::vector<uint8_t> const& data, Macro& m, std::string& err) {
+    Gdr2Try fallback;
+    bool haveFallback = false;
+    std::string firstErr;
+    bool sawPlatformer = false;
+    bool first = true;
+
+    // Try the layout the bots write today first, then the alternatives. The first
+    // layout that explains every byte of the file wins.
+    for (int strMode : {0, 1}) {
+        for (bool ext : {false, true}) {
+            for (NumMode mode : {NumMode::BigEndian, NumMode::LittleEndian, NumMode::Varint}) {
+                for (int packing : {0, 1}) {
+                    bool isMain = first;
+                    first = false;
+                    Gdr2Try t = tryGdr2(data, mode, ext, packing, strMode);
+                    if (isMain && t.platformer) sawPlatformer = true;
+                    if (!t.ok) {
+                        if (firstErr.empty()) firstErr = t.err;
+                        continue;
+                    }
+                    if (t.full) {
+                        m = std::move(t.m);
+                        return true;
+                    }
+                    if (isMain) { fallback = std::move(t); haveFallback = true; }
+                }
+            }
         }
     }
-    if (!ok) {
-        // last resort: accept a clean parse that leaves a few trailing bytes
-        for (bool ext : order) {
-            if (readInputs(r, total, p1, ext, inputs, endPos)) { ok = true; break; }
-        }
+    if (haveFallback) {
+        m = std::move(fallback.m);
+        return true;
     }
-    if (!ok) {
-        err = "Could not read the GDR2 inputs (unknown input layout).";
-        return false;
-    }
-    m.inputs = std::move(inputs);
-    return true;
+    err = sawPlatformer ? "Platformer macros are not supported."
+                        : "Could not read this GDR2 file: " + (firstErr.empty() ? std::string("unknown layout") : firstErr);
+    return false;
 }
 
 // ---------------------------------------------------- generic value tree ----
@@ -508,6 +559,13 @@ bool parseMacro(std::vector<uint8_t> const& data, Macro& out, std::string& err) 
     }
     m.inputs = std::move(jump);
     m.lastTick = m.inputs.back().tick;
+    for (auto const& in : m.inputs) {
+        if (in.down) ++m.presses; else ++m.releases;
+    }
+    if (m.presses == 0) {
+        err = "The macro has no press inputs, only " + std::to_string(m.releases) + " releases (wrong format?).";
+        return false;
+    }
     out = std::move(m);
     return true;
 }

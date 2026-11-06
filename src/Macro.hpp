@@ -23,6 +23,8 @@ struct Macro {
     bool platformer = false;
     std::vector<MacroInput> inputs;  // jump inputs only, sorted by tick
     int64_t lastTick = 0;
+    size_t presses = 0;
+    size_t releases = 0;
 };
 
 bool parseMacro(std::vector<uint8_t> const& data, Macro& out, std::string& err);
