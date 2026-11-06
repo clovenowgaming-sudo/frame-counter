@@ -11,11 +11,12 @@ using namespace geode::prelude;
 // Drives the replay: injects the (shifted) inputs on every physics tick and
 // stops the normal frame loop while we step the level ourselves.
 class $modify(FWGameLayer, GJBaseGameLayer) {
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& c = fw::Counter::get();
-        bool mine = c.running() && c.ownsLayer(this);
+        // half ticks are not full physics ticks, only count/inject on full ones
+        bool mine = !isHalfTick && c.running() && c.ownsLayer(this);
         if (mine) c.beforeStep(this);
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         if (mine) c.afterStep();
     }
 
