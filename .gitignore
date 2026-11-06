@@ -1,0 +1,7 @@
+build/
+*.geode
+.vscode/
+.idea/
+test/t
+test/*.gdr
+test/*.gdr2
